@@ -3,6 +3,7 @@ package com.example.optbackend.service;
 import cn.hutool.core.date.DateTime;
 import com.alibaba.fastjson.JSONArray;
 import com.example.optbackend.dto.OtpCodeDto;
+import com.example.optbackend.dto.OtpCodeGetDto;
 import com.example.optbackend.entity.OtpCode;
 import com.example.optbackend.mapper.OtpCodeMapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -74,22 +75,81 @@ public class OtpCodeService {
         }
     }
 
-    public Map<String, String> getAllOptCodes() {
+    public Map<String, OtpCodeGetDto> getAllOptCodes() {
         String sql = "SELECT * FROM code_info";
+        // 假设 code_info 表里包含：appname、secret、digits、code_interval（单位：秒）
         List<Map<String, Object>> result = jdbcTemplate.queryForList(sql);
-        Map<String, String> resp = new HashMap<>();
-        for (Map<String, Object> map : result) {
-            String appname = map.get("appname").toString();
+
+        Map<String, OtpCodeGetDto> resp = new HashMap<>();
+
+        long nowMillis = System.currentTimeMillis();
+        long nowSec = nowMillis / 1000L;
+
+        for (Map<String, Object> row : result) {
+            String appname = row.get("appname").toString();
+            String secret = row.get("secret").toString();
+            int digits = Integer.parseInt(row.get("digits").toString());
+            long codeIntervalSeconds = Long.parseLong(row.get("code_interval").toString());
+
+            // 1) 构造 GoogleAuthenticatorConfig
             GoogleAuthenticatorConfig config = new GoogleAuthenticatorConfig.GoogleAuthenticatorConfigBuilder()
-                    .setCodeDigits(Integer.parseInt((String) map.get("digits")))
-                    .setTimeStepSizeInMillis(Integer.parseInt(map.get("code_interval").toString()) * 1000L)
+                    .setCodeDigits(digits)
+                    // 将 code_interval（单位：秒）转换为 毫秒
+                    .setTimeStepSizeInMillis(codeIntervalSeconds * 1000L)
                     .build();
+
             GoogleAuthenticator gAuth = new GoogleAuthenticator(config);
-            resp.put(appname, String.valueOf(gAuth.getTotpPassword(map.get("secret").toString())));
 
+            // 2) 生成当前这一时刻的 TOTP
+            int currentCode = gAuth.getTotpPassword(secret);
+            String codeStr = String.format("%0" + digits + "d", currentCode);
 
+            // 3) 计算剩余秒数：ttlSec
+            //    当前完整步数 index = floor(nowSec / codeIntervalSeconds)
+            long currentStepIndex = nowSec / codeIntervalSeconds;
+            //    下一个窗口起始时间戳（秒）：
+            long nextStepStartSec = (currentStepIndex + 1) * codeIntervalSeconds;
+            //    剩余秒数
+            long ttlSec = nextStepStartSec - nowSec;
+            if (ttlSec < 0) {
+                ttlSec = 0;
+            }
+
+            // 4) 把 code 与 ttl 放到 DTO 里
+            OtpCodeGetDto dto = new OtpCodeGetDto();
+            dto.setCode(codeStr);
+            dto.setTtl(ttlSec);
+            resp.put(appname, dto);
         }
+
         return resp;
+    }
+    public Boolean changePassword(String username,String oldPassword,String newPassword){
+        String sqlGet = "SELECT `password` FROM `user` WHERE `username` = ?";
+        try {
+            String storedHash = jdbcTemplate.queryForObject(sqlGet, new Object[]{username}, String.class);
+            if (!passwordEncoder.matches(oldPassword, storedHash)) {
+                // 验证失败
+                return false;
+            }
+        } catch (EmptyResultDataAccessException e) {
+            // 用户不存在
+            return false;
+        }
+        String sqlUpdate = "UPDATE `user` SET `password` = ? WHERE `username` = ?";
+        jdbcTemplate.update(sqlUpdate, passwordEncoder.encode(newPassword), username);
+        return true;
+    }
+    public String getLevelByUserName(String username){
+        String sqlGet = "SELECT `level` FROM `user` WHERE `username` = ?";
+        String level;
+        try {
+            level = jdbcTemplate.queryForObject(sqlGet, new Object[]{username}, String.class);
+        } catch (EmptyResultDataAccessException e) {
+            // 用户不存在
+            return null;
+        }
+        return level;
     }
 
     public String login(String username, String password) {
